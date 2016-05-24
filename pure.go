@@ -17,6 +17,7 @@ func getId() int {
 	return nextId
 }
 
+// Log messages Level
 const (
 	Error = iota
 	Debug = iota
@@ -25,7 +26,7 @@ const (
 
 type LogMessage struct {
 	Level   int
-	Id      int
+	Code    int
 	Message string
 }
 
@@ -56,7 +57,7 @@ type PureHandler interface {
 	Retrieve(PureReq, ResponseWriter)
 	Update(PureReq, ResponseWriter)
 	Delete(PureReq, ResponseWriter)
-	Flush(PureReq)
+	Flush(PureReq, ResponseWriter)
 }
 
 type PureMux struct {
@@ -65,13 +66,6 @@ type PureMux struct {
 
 func (p *PureMux) Handle(m PureReq) {
 
-	handler, ok := p.handlers[m.Msg.DataType]
-
-	if !ok {
-		fmt.Println("Error Handler not Found")
-		return
-	}
-
 	rw := &PureResponseWriter{msg: &PureMsg{ResponseMap: make(map[string]interface{})}}
 	rw.connections = append(rw.connections, m.Conn)
 	rw.msg.TransactionMap = m.Msg.TransactionMap
@@ -79,13 +73,21 @@ func (p *PureMux) Handle(m PureReq) {
 	rw.msg.Action = m.Msg.Action
 	rw.success = true
 
+	handler, ok := p.handlers[m.Msg.DataType]
+
+	if !ok {
+		rw.AddLogMsg(Error, 404, fmt.Sprintf("Impossible to find Handler"))
+		rw.Fail()
+		return
+	}
+
 	defer func() {
 
-		//if r := recover(); r != nil {
-		//rw.AddLogMsg(Error, fmt.Sprintf("Panic occured %s", r))
-		//rw.Fail()
-
-		/*}*/
+		// Recover from panic
+		if r := recover(); r != nil {
+			rw.AddLogMsg(Error, 500, fmt.Sprintf("Panic occured %s", r))
+			rw.Fail()
+		}
 
 		msg := rw.GetMsg()
 
@@ -106,6 +108,9 @@ func (p *PureMux) Handle(m PureReq) {
 
 	} else if m.Msg.Action == "delete" {
 		handler.Delete(m, rw)
+
+	} else if m.Msg.Action == "flush" {
+		handler.Delete(m, rw)
 	}
 
 }
@@ -118,30 +123,48 @@ func (p *PureMux) RegisterHandler(dataType string, handler PureHandler) {
 	p.handlers[dataType] = handler
 }
 
-type GoConn struct {
-	Response chan PureMsg
-	Muxer    *PureMux
+// Return true if the request should go to next handler, false otherwise
+type Middleware func(PureReq, ResponseWriter) bool
+
+type MiddlewareHandler struct {
+	handler    PureHandler
+	middleware Middleware
 }
 
-func (c *GoConn) Send(msg PureMsg) {
-	fmt.Println("Send")
-	c.Response <- msg
+func (m MiddlewareHandler) Create(req PureReq, rw ResponseWriter) {
+	if m.middleware(req, rw) {
+		m.handler.Create(req, rw)
+	}
 }
 
-func (c *GoConn) Handle(msg PureMsg) {
-	fmt.Println("Handle")
-	req := PureReq{Msg: msg, Conn: c}
-	c.Muxer.Handle(req)
+func (m MiddlewareHandler) Retrieve(req PureReq, rw ResponseWriter) {
+	if m.middleware(req, rw) {
+		m.handler.Retrieve(req, rw)
+	}
 }
 
-func (c *GoConn) SendReq(msg PureMsg) error {
-	c.Handle(msg)
-	return nil
+func (m MiddlewareHandler) Update(req PureReq, rw ResponseWriter) {
+	if m.middleware(req, rw) {
+		m.handler.Update(req, rw)
+	}
 }
 
-func (c *GoConn) ReadResp() PureMsg {
-	fmt.Println("Read")
-	return <-c.Response
+func (m MiddlewareHandler) Delete(req PureReq, rw ResponseWriter) {
+	if m.middleware(req, rw) {
+		m.handler.Delete(req, rw)
+	}
+}
+
+func (m MiddlewareHandler) Flush(req PureReq, rw ResponseWriter) {
+	if m.middleware(req, rw) {
+		m.handler.Delete(req, rw)
+	}
+}
+
+func AddMiddleware(h PureHandler, m Middleware) PureHandler {
+
+	handler := MiddlewareHandler{middleware: m, handler: h}
+	return handler
 }
 
 type ResponseWriter interface {
@@ -173,8 +196,8 @@ func (rw *PureResponseWriter) AddValue(key string, value interface{}) {
 	rw.msg.ResponseMap[key] = value
 }
 
-func (rw *PureResponseWriter) AddLogMsg(level int, text string) {
-	rw.msg.LogList = append(rw.msg.LogList, LogMessage{level, 0, text})
+func (rw *PureResponseWriter) AddLogMsg(level int, code int, text string) {
+	rw.msg.LogList = append(rw.msg.LogList, LogMessage{level, code, text})
 }
 
 func (rw *PureResponseWriter) Fail() {
@@ -202,6 +225,39 @@ func GetResponseAction(requestAction string, success bool) string {
 	return ResponseAction[success][requestAction]
 }
 
+type RequestMapDecoder func(json.RawMessage) (error, map[string]interface{})
+
+//
+// Golang Direct implementation
+//
+
+type GoConn struct {
+	Response chan PureMsg
+	Muxer    *PureMux
+}
+
+func (c *GoConn) Send(msg PureMsg) {
+	c.Response <- msg
+}
+
+func (c *GoConn) Handle(msg PureMsg) {
+	req := PureReq{Msg: msg, Conn: c}
+	c.Muxer.Handle(req)
+}
+
+func (c *GoConn) SendReq(msg PureMsg) error {
+	c.Handle(msg)
+	return nil
+}
+
+func (c *GoConn) ReadResp() PureMsg {
+	return <-c.Response
+}
+
+//
+// Websocket Implementation
+//
+
 type HttpHandler struct {
 	muxer   PureMux
 	decoder RequestMapDecoder
@@ -216,8 +272,6 @@ var upgrader = websocket.Upgrader{
 type WebsocketHello struct {
 	ClientId int
 }
-
-type RequestMapDecoder func(json.RawMessage) (error, map[string]interface{})
 
 func (handler HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
@@ -242,9 +296,6 @@ func (handler HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	conn.WriteMessage(websocket.TextMessage, []byte(jsonHello))
 
 	for {
-
-		// We might want to add logging at sone point
-		// TODO
 
 		//  Discard message Type, if not text the unmarshaling will fail anyway
 		_, p, err := conn.ReadMessage()
